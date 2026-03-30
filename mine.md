@@ -9,7 +9,6 @@ make worker-logs
 
 dccker compose restart api
 docker compose up -d --force-recreate beat
-docker compose build worker && docker compose up -d --force-recreate worker
 
 # 3. Create your user
 curl -X POST http://localhost:8000/users \

@@ -35,20 +35,58 @@ logger = get_logger(__name__)
     max_retries=1,
 )
 def dispatch_all_sources(self):
-    """Beat entry-point: dispatch one scrape_source task per active source."""
+    """Beat entry-point: dispatch one scrape_source task per unique (source, brand, model)
+    combination derived from active filters.
+
+    This ensures we only scrape targeted search URLs (e.g. /osobowe/toyota/yaris)
+    rather than all 240k+ listings on the marketplace.
+    """
     asyncio.run(_dispatch_all_sources_async())
 
 
 async def _dispatch_all_sources_async() -> None:
     from sqlalchemy import select
 
-    async with _make_session()() as db:
-        result = await db.execute(select(Source).where(Source.is_active == True))  # noqa: E712
-        sources = list(result.scalars().all())
+    from app.models.filter import Filter
 
-    for source in sources:
-        logger.info("dispatching_scrape", source=source.slug)
-        scrape_source.delay(source.slug)
+    # Get all active sources
+    async with _make_session()() as db:
+        source_result = await db.execute(select(Source).where(Source.is_active == True))  # noqa: E712
+        sources = {s.id: s for s in source_result.scalars().all()}
+
+        # Get all active filters that have at least a brand specified
+        filter_result = await db.execute(
+            select(Filter.brand, Filter.model, Filter.sources).where(Filter.is_active == True)  # noqa: E712
+        )
+        filters = filter_result.all()
+
+    # Build set of (source_slug, brand, model) search targets
+    search_targets: set[tuple[str, str | None]] = set()
+    for brand, model, filter_sources in filters:
+        if not brand:
+            # Skip filters with no brand — too broad
+            logger.warning("dispatch_skip_filter_no_brand", model=model)
+            continue
+        # Determine which sources this filter applies to
+        if filter_sources:
+            applicable_sources = [sources[sid] for sid in filter_sources if sid in sources]
+        else:
+            applicable_sources = list(sources.values())
+
+        for source in applicable_sources:
+            search_targets.add((source.slug, brand.lower(), model.lower() if model else None))
+
+    if not search_targets:
+        logger.warning("dispatch_no_search_targets", reason="no active filters with brand set")
+        return
+
+    for slug, brand, model in sorted(search_targets):
+        path_parts = [brand]
+        if model:
+            path_parts.append(model)
+        search_path = "/" + "/".join(path_parts)
+        logger.info("dispatching_scrape", source=slug, brand=brand, model=model)
+        scrape_source.delay(slug, search_path)
 
 
 @celery_app.task(
@@ -59,16 +97,17 @@ async def _dispatch_all_sources_async() -> None:
     autoretry_for=(httpx.HTTPError,),
     retry_backoff=True,
 )
-def scrape_source(self, source_slug: str) -> dict:
-    """Scrape a single source and persist new listings.
+def scrape_source(self, source_slug: str, search_path: str | None = None) -> dict:
+    """Scrape a single source (optionally filtered by search_path) and persist new listings.
 
+    search_path: URL suffix appended to the scraper's BASE_URL, e.g. '/toyota/yaris'.
     For each new listing found, chains a notify_matching_filters task.
     Updates scrape_run with final status and counts.
     """
-    return asyncio.run(_scrape_source_async(source_slug))
+    return asyncio.run(_scrape_source_async(source_slug, search_path))
 
 
-async def _scrape_source_async(source_slug: str) -> dict:
+async def _scrape_source_async(source_slug: str, search_path: str | None = None) -> dict:
     from app.tasks.notification_tasks import notify_matching_filters
 
     scraper_cls = SCRAPER_REGISTRY.get(source_slug)
@@ -101,7 +140,8 @@ async def _scrape_source_async(source_slug: str) -> dict:
 
     try:
         async with httpx.AsyncClient(follow_redirects=True) as http_client:
-            scraper = scraper_cls(http_client)
+            base_url = (scraper_cls.BASE_URL.rstrip("/") + search_path) if search_path else None
+            scraper = scraper_cls(http_client, base_url=base_url)
 
             async with _make_session()() as db:
                 async for listing_create in scraper.scrape_all():

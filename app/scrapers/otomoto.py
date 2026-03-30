@@ -27,8 +27,14 @@ class OtomotoScraper(BaseScraper):
     BASE_URL = "https://www.otomoto.pl/osobowe"
     MAX_PAGES = 50
 
-    def __init__(self, session: httpx.AsyncClient, query_params: dict | None = None) -> None:
+    def __init__(
+        self,
+        session: httpx.AsyncClient,
+        base_url: str | None = None,
+        query_params: dict | None = None,
+    ) -> None:
         super().__init__(session)
+        self._base_url = base_url or self.BASE_URL
         self._query_params = query_params or {}
         self._total_count: int = 0
         self._page_size: int = 32
@@ -38,7 +44,7 @@ class OtomotoScraper(BaseScraper):
         params = {"page": page, **self._query_params}
         try:
             response = await self._session.get(
-                self.BASE_URL,
+                self._base_url,
                 params=params,
                 headers=self.HEADERS,
                 timeout=self.REQUEST_TIMEOUT,
