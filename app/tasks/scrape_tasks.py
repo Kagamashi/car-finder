@@ -4,14 +4,27 @@ import uuid
 from datetime import datetime, timezone
 
 import httpx
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.pool import NullPool
 
-from app.database import async_session_maker
+from app.config import settings
 from app.models.scrape_run import ScrapeRun
 from app.models.source import Source
 from app.scrapers import SCRAPER_REGISTRY
 from app.services import listing_service
 from app.tasks.celery_app import celery_app
 from app.utils.logging import get_logger
+
+
+def _make_session():
+    """Create a fresh engine+session per task using NullPool.
+
+    Required for Celery prefork workers: asyncpg connections are bound to a
+    specific event loop. NullPool ensures no connections are shared across
+    forked processes.
+    """
+    engine = create_async_engine(settings.DATABASE_URL, poolclass=NullPool)
+    return async_sessionmaker(engine, expire_on_commit=False)
 
 logger = get_logger(__name__)
 
@@ -29,7 +42,7 @@ def dispatch_all_sources(self):
 async def _dispatch_all_sources_async() -> None:
     from sqlalchemy import select
 
-    async with async_session_maker() as db:
+    async with _make_session()() as db:
         result = await db.execute(select(Source).where(Source.is_active == True))  # noqa: E712
         sources = list(result.scalars().all())
 
@@ -65,7 +78,7 @@ async def _scrape_source_async(source_slug: str) -> dict:
 
     # Create scrape run record
     scrape_run_id = uuid.uuid4()
-    async with async_session_maker() as db:
+    async with _make_session()() as db:
         from sqlalchemy import select
 
         source_result = await db.execute(
@@ -90,14 +103,15 @@ async def _scrape_source_async(source_slug: str) -> dict:
         async with httpx.AsyncClient(follow_redirects=True) as http_client:
             scraper = scraper_cls(http_client)
 
-            async with async_session_maker() as db:
+            async with _make_session()() as db:
                 async for listing_create in scraper.scrape_all():
                     listings_found += 1
                     try:
                         listing, is_new = await listing_service.upsert_listing(db, listing_create)
                         if is_new:
                             listings_new += 1
-                            # Dispatch notification task (fire-and-forget)
+                            # Commit first so the notification task can find the listing in DB
+                            await db.commit()
                             notify_matching_filters.delay(str(listing.id))
                     except Exception as exc:
                         logger.error(
@@ -121,7 +135,7 @@ async def _scrape_source_async(source_slug: str) -> dict:
         )
 
     # Update scrape run record
-    async with async_session_maker() as db:
+    async with _make_session()() as db:
         from sqlalchemy import select, update
 
         await db.execute(

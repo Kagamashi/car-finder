@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import Boolean, Index, Integer, Numeric, SmallInteger, String, Text, func
+from sqlalchemy import Boolean, ForeignKey, Index, Integer, Numeric, SmallInteger, String, Text, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -13,7 +13,7 @@ class Listing(Base):
     __tablename__ = "listings"
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
-    source_id: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    source_id: Mapped[int] = mapped_column(ForeignKey("sources.id"), nullable=False)
     url: Mapped[str] = mapped_column(Text, unique=True, nullable=False)
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     title: Mapped[str] = mapped_column(Text, nullable=False)

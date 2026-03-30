@@ -65,10 +65,10 @@ services:
 
   beat:
     build: .
-    command: celery -A app.tasks.celery_app beat --loglevel=info --scheduler celery.beat:PersistentScheduler
+    command: celery -A app.tasks.celery_app beat --loglevel=info --schedule=/app/celerybeat-data/celerybeat-schedule
     volumes:
       - .:/app
-      - beat_data:/app/celerybeat-schedule
+      - beat_data:/app/celerybeat-data
     env_file:
       - .env
     depends_on:

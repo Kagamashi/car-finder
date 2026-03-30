@@ -27,16 +27,24 @@ def notify_matching_filters(self, listing_id_str: str) -> dict:
 
 
 async def _notify_matching_filters_async(listing_id_str: str) -> dict:
-    from app.database import async_session_maker
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+    from sqlalchemy.pool import NullPool
+
+    from app.config import settings
     from app.models.listing import Listing
     from app.services import filter_service, notification_service
     from sqlalchemy import select
+
+    session_factory = async_sessionmaker(
+        create_async_engine(settings.DATABASE_URL, poolclass=NullPool),
+        expire_on_commit=False,
+    )
 
     listing_id = uuid.UUID(listing_id_str)
     sent_count = 0
     skipped_count = 0
 
-    async with async_session_maker() as db:
+    async with session_factory() as db:
         result = await db.execute(select(Listing).where(Listing.id == listing_id))
         listing = result.scalar_one_or_none()
 

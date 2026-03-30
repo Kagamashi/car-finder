@@ -1,5 +1,4 @@
 import json
-import re
 from decimal import Decimal, InvalidOperation
 
 import httpx
@@ -15,23 +14,25 @@ logger = get_logger(__name__)
 
 
 class OtomotoScraper(BaseScraper):
-    """Scraper for otomoto.pl (Next.js, data in __NEXT_DATA__ script tag).
+    """Scraper for otomoto.pl.
 
-    OTOMOTO renders listing data server-side via Next.js. The full JSON state
-    is embedded in a <script id="__NEXT_DATA__"> tag on every search results page.
+    OTOMOTO uses Next.js with urql (GraphQL client). Listing data is embedded in
+    __NEXT_DATA__ → props.pageProps.urqlState → the entry containing 'advertSearch'
+    → inner JSON string → advertSearch.edges[*].node.
 
-    Data path: props.pageProps.data.advertSearch.edges[*].node
-    Pagination: props.pageProps.data.advertSearch.pageInfo.hasNextPage
+    Pagination: page query param, stop when currentOffset + pageSize >= totalCount.
     """
 
     source_slug = "otomoto"
     BASE_URL = "https://www.otomoto.pl/osobowe"
-    MAX_PAGES = 50  # OTOMOTO typically has 32 items/page; 50 pages = ~1600 listings
+    MAX_PAGES = 50
 
     def __init__(self, session: httpx.AsyncClient, query_params: dict | None = None) -> None:
         super().__init__(session)
         self._query_params = query_params or {}
-        self._last_page_info: dict = {}
+        self._total_count: int = 0
+        self._page_size: int = 32
+        self._current_offset: int = 0
 
     async def fetch_page(self, page: int) -> bytes:
         params = {"page": page, **self._query_params}
@@ -49,89 +50,97 @@ class OtomotoScraper(BaseScraper):
         except httpx.RequestError as exc:
             raise ScraperError(f"Request failed on page {page}: {exc}") from exc
 
-    def parse_page(self, raw: bytes) -> list[dict]:
+    def _extract_advert_search(self, raw: bytes) -> dict:
+        """Extract the advertSearch GraphQL cache entry from __NEXT_DATA__."""
         soup = BeautifulSoup(raw, "lxml")
         script_tag = soup.find("script", {"id": "__NEXT_DATA__"})
         if not script_tag or not script_tag.string:
             raise ScraperError("__NEXT_DATA__ script tag not found or empty")
 
         try:
-            data = json.loads(script_tag.string)
+            page_data = json.loads(script_tag.string)
         except json.JSONDecodeError as exc:
             raise ScraperError(f"Failed to parse __NEXT_DATA__ JSON: {exc}") from exc
 
-        advert_search = (
-            data.get("props", {})
+        urql_state = (
+            page_data.get("props", {})
             .get("pageProps", {})
-            .get("data", {})
-            .get("advertSearch", {})
+            .get("urqlState", {})
         )
-        self._last_page_info = advert_search.get("pageInfo", {})
+
+        for entry in urql_state.values():
+            try:
+                inner = json.loads(entry.get("data", "{}"))
+            except (json.JSONDecodeError, AttributeError):
+                continue
+            if "advertSearch" in inner:
+                return inner["advertSearch"]
+
+        raise ScraperError("advertSearch not found in urqlState")
+
+    def parse_page(self, raw: bytes) -> list[dict]:
+        advert_search = self._extract_advert_search(raw)
+
+        page_info = advert_search.get("pageInfo", {})
+        self._total_count = advert_search.get("totalCount", 0)
+        self._page_size = page_info.get("pageSize", 32)
+        self._current_offset = page_info.get("currentOffset", 0)
+
         edges = advert_search.get("edges", [])
         return [edge["node"] for edge in edges if "node" in edge]
 
     def has_next_page(self, raw: bytes, page: int) -> bool:
-        return bool(self._last_page_info.get("hasNextPage", False)) and page < self.MAX_PAGES
+        next_offset = self._current_offset + self._page_size
+        return next_offset < self._total_count and page < self.MAX_PAGES
 
     def normalize_item(self, raw_item: dict) -> ListingCreate:
-        # Build parameters lookup: {key: value}
-        params = {
-            p.get("key", ""): p.get("value", {}).get("key") or p.get("displayValue", "")
-            for p in raw_item.get("parameters", [])
-            if p.get("key")
-        }
+        # Parameters lookup: {key: value} — value is already normalized (e.g. "electric", "2023")
+        params = {p["key"]: p for p in raw_item.get("parameters", []) if p.get("key")}
+
+        def param_val(key: str) -> str | None:
+            return params[key]["value"] if key in params else None
+
+        def param_display(key: str) -> str | None:
+            return params[key]["displayValue"] if key in params else None
 
         # Price
-        price_data = raw_item.get("price", {}) or {}
-        price_amount = price_data.get("amount", {}) or {}
-        price_raw = price_amount.get("units")
+        price_data = (raw_item.get("price") or {}).get("amount") or {}
+        price_raw = price_data.get("units")
         try:
             price = Decimal(str(price_raw)) if price_raw is not None else None
         except InvalidOperation:
             price = None
+        currency = price_data.get("currencyCode", "PLN") or "PLN"
 
-        currency = (
-            (price_data.get("currency", {}) or {}).get("code", "PLN") or "PLN"
-        )
-
-        # Mileage — "150 000 km" → 150000
-        mileage_raw = params.get("mileage") or raw_item.get("mileage")
-        mileage_km: int | None = None
-        if mileage_raw:
-            digits = re.sub(r"[^\d]", "", str(mileage_raw))
-            mileage_km = int(digits) if digits else None
+        # Mileage — value is a plain number string e.g. "18000"
+        mileage_raw = param_val("mileage")
+        try:
+            mileage_km = int(mileage_raw) if mileage_raw else None
+        except (ValueError, TypeError):
+            mileage_km = None
 
         # Year
-        year_raw = params.get("year") or raw_item.get("year")
+        year_raw = param_val("year")
         try:
             year = int(year_raw) if year_raw else None
         except (ValueError, TypeError):
             year = None
 
         # Location
-        location_data = raw_item.get("location", {}) or {}
-        city = (location_data.get("city", {}) or {}).get("name")
-        region = (location_data.get("region", {}) or {}).get("name")
+        location_data = raw_item.get("location") or {}
+        city = (location_data.get("city") or {}).get("name")
+        region = (location_data.get("region") or {}).get("name")
         location = city or region
 
-        # Brand / model from category path or title
-        category = raw_item.get("category", {}) or {}
-        brand: str | None = None
-        model: str | None = None
+        # Brand / model from parameters
+        brand = param_display("make")
+        model = param_display("model")
 
-        # OTOMOTO nests category: {id, name, ...} — the breadcrumb is in the path
-        # Try to extract from the normalized URL or category name
-        category_path = raw_item.get("categoryPath", []) or []
-        if len(category_path) >= 2:
-            brand = category_path[1].get("name") if len(category_path) > 1 else category.get("name")
-            model = category_path[2].get("name") if len(category_path) > 2 else None
-        else:
-            brand = params.get("make") or category.get("name")
-            model = params.get("model")
+        # Fuel type — value is already English e.g. "electric", "diesel"
+        fuel_type = normalize_fuel_type(param_val("fuel_type"))
 
         title = raw_item.get("title", "")
         url = raw_item.get("url", "")
-
         content_hash = compute_content_hash(title, price, mileage_km)
 
         return ListingCreate(
@@ -144,7 +153,7 @@ class OtomotoScraper(BaseScraper):
             location=location,
             mileage_km=mileage_km,
             year=year,
-            fuel_type=normalize_fuel_type(params.get("fuel_type")),
+            fuel_type=fuel_type,
             brand=brand,
             model=model,
             raw_data=raw_item,
